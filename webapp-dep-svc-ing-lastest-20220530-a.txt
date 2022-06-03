@@ -1,0 +1,106 @@
+pipeline {
+  agent {
+    node {
+      label 'maven'
+    }
+  }
+  parameters {
+      string(name:'TAG_NAME',defaultValue: '',description:'')
+  }
+  environment {
+      HB_CREDENTIAL_ID = 'harbor-key'
+      HB_USERNAME = 'admin'
+      HB_PASSWORD = 'Anrndghk1!@'
+      KUBECONFIG_CREDENTIAL_ID = 'k8sadmin-key'
+      HB_REGISTRY = 'krharbor1.tcis.com'
+      HB_NAMESPACE = 'lsw_work_02'
+      APP_NAME = 'dks-webapparch'
+      B_VERSION = 'latest'
+      BRANCH_NAME = 'dev'
+      PROJECT_NAME = 'dks-dev-prj-01'
+      PROJECT_NAME_PROD = 'dks-prod-prj-01'
+  }
+  stages {
+    stage('Clone gitlab for dks-webapp') {
+      agent none
+      steps {
+        git(url: 'ssh://git@gitlab.tcis.com/swlyu/dks-webapp.git', credentialsId: 'gitlab-key', changelog: true, poll: false, branch: 'dev')
+      }
+    }
+    stage('Build WAR') {
+      steps {
+        container('maven') {
+          sh 'mvn -s /opt/apache-maven-3.5.3/conf/settings.xml -Dmaven.wagon.http.ssl.insecure=true -Dmaven.test.skip=true -U -Dbuildversion=1.0-SNAPSHOT clean package'
+        }
+      }
+    }
+    stage('Deploy Artifact to Nexus') {
+      steps {
+        container('maven') {
+          sh 'mvn -s /opt/apache-maven-3.5.3/conf/settings.xml -Dmaven.wagon.http.ssl.insecure=true -Dmaven.test.skip=true -U -Dbuildversion=1.0-SNAPSHOT deploy'
+        }
+      }
+    }
+    stage ('Upload Artifact to Local') {
+      steps {
+          archiveArtifacts artifacts: 'target/*.war', followSymlinks: false
+      }
+    }
+    stage ('DEV:Build Img & Push to Harbor') {
+      steps {
+        container ('maven') {
+          sh "mvn -s /opt/apache-maven-3.5.3/conf/settings.xml -Dmaven.wagon.http.ssl.insecure=true -Dmaven.test.skip=true -U -Dbuildversion=1.0-SNAPSHOT clean package"
+          withCredentials([usernamePassword(passwordVariable : 'HB_PASSWORD' ,usernameVariable : 'HB_USERNAME' ,credentialsId : "$HB_CREDENTIAL_ID" ,)]) {
+          sh 'echo "$HB_PASSWORD" | podman login --tls-verify=false $HB_REGISTRY -u "$HB_USERNAME" --password-stdin'
+          sh 'podman build --tls-verify=false -t $HB_REGISTRY/$HB_NAMESPACE/$APP_NAME:$B_VERSION-$BRANCH_NAME .'
+          sh 'podman push  --tls-verify=false $HB_REGISTRY/$HB_NAMESPACE/$APP_NAME:$B_VERSION-$BRANCH_NAME'
+          }
+        }
+      }
+    }
+    stage('Deploy App to Dev-NS') {
+      steps {
+       container ('maven') {
+         withCredentials([
+            kubeconfigFile(credentialsId: env.KUBECONFIG_CREDENTIAL_ID,variable: 'KUBECONFIG')
+         ]) {
+              sh 'envsubst < k8sdeploy/dks-webapp-depsvcing.yaml | kubectl apply -f -'
+              sh 'kubectl -n $PROJECT_NAME rollout restart deploy dks-webapp01dev-dep'
+            }
+       }
+     }
+    }
+    stage ('Need to review Dev App for PROD IMG Build & Deploy') {
+      agent none
+      steps {
+        timeout(time:60, unit:'MINUTES') {
+         input message: "OCI-Img Buid & Deploy App to PROD? Important: need review Dev App and then deploy PROD PoD Image", ok: "Promote"
+        }
+      }
+    }
+    stage ('PROD:Build Img & Push to Harbor') {
+      steps {
+        container ('maven') {
+          sh "mvn -s /opt/apache-maven-3.5.3/conf/settings.xml -Dmaven.wagon.http.ssl.insecure=true -Dmaven.test.skip=true -U -Dbuildversion=1.0-SNAPSHOT clean package"
+          withCredentials([usernamePassword(passwordVariable : 'HB_PASSWORD' ,usernameVariable : 'HB_USERNAME' ,credentialsId : "$HB_CREDENTIAL_ID" ,)]) {
+          sh 'echo "$HB_PASSWORD" | podman login --tls-verify=false $HB_REGISTRY -u "$HB_USERNAME" --password-stdin'
+          sh 'podman build --tls-verify=false -t $HB_REGISTRY/$HB_NAMESPACE/$APP_NAME:$B_VERSION-prod .'
+          sh 'podman push  --tls-verify=false $HB_REGISTRY/$HB_NAMESPACE/$APP_NAME:$B_VERSION-prod'
+          }
+        }
+      }
+    }
+    stage('Deploy App to PROD-NS') {
+      steps {
+       container ('maven') {
+         withCredentials([
+            kubeconfigFile(credentialsId: env.KUBECONFIG_CREDENTIAL_ID,variable: 'KUBECONFIG')
+         ]) {
+              sh 'envsubst < k8sdeploy/dks-webapp-prod-depsvcing.yaml | kubectl apply -f -'
+              sh 'kubectl -n $PROJECT_NAME_PROD rollout restart deploy dks-webapp01prod-dep'
+            }
+       }
+     }
+    }
+  }
+}
